@@ -82,7 +82,7 @@ struct BookState<B> {
     state: FeedState,
     reason: Reason,
     since: u64,
-    in_txn: bool,
+    processing_transaction: bool,
     valid: bool,
     crossed: bool,
     chained: bool,
@@ -108,7 +108,7 @@ impl<B: OrderBook> BookState<B> {
             state: FeedState::Disconnected,
             reason: Reason::Start,
             since: timing::now(),
-            in_txn: false,
+            processing_transaction: false,
             valid: false,
             crossed: false,
             chained: false,
@@ -125,7 +125,7 @@ impl<B: OrderBook> BookState<B> {
     }
 
     fn tradable(&self) -> bool {
-        self.state == FeedState::Live && !self.in_txn && self.valid && !self.crossed
+        self.state == FeedState::Live && !self.processing_transaction && self.valid && !self.crossed
     }
 
     #[inline]
@@ -147,7 +147,7 @@ impl<B: OrderBook> BookState<B> {
         Snap {
             venue: self.venue,
             state: self.state,
-            in_txn: self.in_txn,
+            processing_transaction: self.processing_transaction,
             valid: self.valid,
             crossed: self.crossed,
             bbo,
@@ -317,7 +317,7 @@ impl<B: OrderBook> Engine<B> {
                     let _ = self.io.ctl[i].push(Control::Resync);
                 }
                 b.batch.iter_mut().for_each(Vec::clear);
-                b.in_txn = true;
+                b.processing_transaction = true;
                 b.pending = (hdr, recv, kind);
                 None
             }
@@ -334,7 +334,7 @@ impl<B: OrderBook> Engine<B> {
                 let t5 = timing::now();
                 let kind;
                 (b.hdr, b.recv, kind) = b.pending;
-                b.in_txn = false;
+                b.processing_transaction = false;
                 b.chained = kind == Kind::Diff;
                 b.commits += 1;
                 let crossed = matches!((b.book.best(Side::Bid), b.book.best(Side::Ask)), (Some(x), Some(y)) if x.px >= y.px);

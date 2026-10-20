@@ -92,7 +92,7 @@ The sequencer (`feed/sync.rs`) is a pure state machine with no I/O and no book, 
 - **Who reads:** the signal, which is a function the engine calls between transactions. HTTP only ever sees `Telemetry` copies (top 10 per side, states, counters, decision, timing) pushed every 100 ms.
 - **Reader vs writer race:** there is no concurrent book access, so a torn book is impossible by construction.
   - The only cross-thread handoff is the SPSC ring: write the slot, Release-store the tail; Acquire-load the tail, read the slot.
-  - A book is flagged `in_txn` between `Begin` and `Commit`, and the signal is never evaluated on a book in that state.
+  - A book is flagged `processing_transaction` between `Begin` and `Commit`, and the signal is never evaluated on a book in that state.
 - **Gap or resync on one venue while the other is alive:**
   - The I/O thread sends `Status(Resyncing)` in order with its data. The engine marks that book non-tradable, and the signal immediately returns `Hold` with a reason such as `not_live(binance)`.
   - The snapshot and bridging diff follow, then `Status(Live)`.

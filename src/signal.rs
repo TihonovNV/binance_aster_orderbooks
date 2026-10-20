@@ -19,7 +19,7 @@ pub enum Why {
     BelowThreshold,
     ImbalanceVeto,
     NotLive(Venue),
-    InTxn(Venue),
+    ProcessingTransaction(Venue),
     Invalid(Venue),
     Empty(Venue),
     Crossed(Venue),
@@ -33,7 +33,7 @@ pub enum Why {
 pub struct Snap {
     pub venue: Venue,
     pub state: FeedState,
-    pub in_txn: bool,
+    pub processing_transaction: bool,
     pub valid: bool,
     pub crossed: bool,
     pub bbo: Option<Bbo>,
@@ -96,8 +96,8 @@ fn gate(s: &Snap, p: &SignalParams) -> Option<Why> {
     let Some(bbo) = s.bbo else { return Some(Why::Empty(v)) };
     if s.state != FeedState::Live {
         Some(Why::NotLive(v))
-    } else if s.in_txn {
-        Some(Why::InTxn(v))
+    } else if s.processing_transaction {
+        Some(Why::ProcessingTransaction(v))
     } else if !s.valid {
         Some(Why::Invalid(v))
     } else if s.crossed {
@@ -113,15 +113,24 @@ fn gate(s: &Snap, p: &SignalParams) -> Option<Why> {
 
 /// Lead-lag: Binance microprice vs Aster mid, de-biased by an EMA of the gap,
 /// confirmed by Aster top-5 imbalance, with enter θ / exit θ/2 hysteresis.
-pub fn decide(b: &Snap, a: &Snap, st: &mut SignalState, p: &SignalParams, now_ns: u64, ts_ms: u64) -> Decision {
-    let mut d = Decision { ts_ms, age_b_ms: b.age_ms, age_a_ms: a.age_ms, seq_b: b.seq, seq_a: a.seq, ..Default::default() };
-    if let Some(x) = b.bbo {
+pub fn decide(binance_snapshot: &Snap, aster_snapshot: &Snap, st: &mut SignalState, p: &SignalParams, now_ns: u64, ts_ms: u64) -> Decision {
+    let mut d = Decision {
+        ts_ms,
+        age_b_ms: binance_snapshot.age_ms,
+        age_a_ms: aster_snapshot.age_ms,
+        seq_b: binance_snapshot.seq,
+        seq_a: aster_snapshot.seq,
+        ..Default::default()
+    };
+    if let Some(x) = binance_snapshot.bbo {
         (d.bid_b, d.ask_b, d.micro_b) = (x.bid, x.ask, x.micro());
     }
-    if let Some(x) = a.bbo {
+    if let Some(x) = aster_snapshot.bbo {
         (d.bid_a, d.ask_a, d.mid_a) = (x.bid, x.ask, x.mid());
     }
-    let blocked = gate(b, p).or_else(|| gate(a, p)).or(((b.age_ms - a.age_ms).abs() > p.max_skew_ms as f64).then_some(Why::Skew));
+    let blocked = gate(binance_snapshot, p)
+        .or_else(|| gate(aster_snapshot, p))
+        .or(((binance_snapshot.age_ms - aster_snapshot.age_ms).abs() > p.max_skew_ms as f64).then_some(Why::Skew));
     if let Some(why) = blocked {
         st.bias = Bias::Hold;
         d.why = why;
@@ -139,8 +148,8 @@ pub fn decide(b: &Snap, a: &Snap, st: &mut SignalState, p: &SignalParams, now_ns
     (st.ema, st.last_ns) = (Some(ema), now_ns);
     d.ema_bps = ema;
     d.dev_bps = d.gap_bps - ema;
-    let depth = a.bid5 + a.ask5;
-    d.imb_a = if depth > 0.0 { (a.bid5 - a.ask5) / depth } else { 0.0 };
+    let depth = aster_snapshot.bid5 + aster_snapshot.ask5;
+    d.imb_a = if depth > 0.0 { (aster_snapshot.bid5 - aster_snapshot.ask5) / depth } else { 0.0 };
 
     let (long_th, short_th) = match st.bias {
         Bias::LongBias => (p.theta_bps / 2.0, p.theta_bps),
@@ -168,7 +177,7 @@ mod tests {
         Snap {
             venue,
             state: FeedState::Live,
-            in_txn: false,
+            processing_transaction: false,
             valid: true,
             crossed: false,
             bbo: Some(Bbo { bid, bid_qty, ask, ask_qty }),
@@ -194,7 +203,7 @@ mod tests {
         type Tweak = Box<dyn Fn(&mut Snap, &mut Snap)>;
         let cases: [(Tweak, Why); 8] = [
             (Box::new(|b, _| b.state = FeedState::Resyncing), Why::NotLive(Venue::Binance)),
-            (Box::new(|_, a| a.in_txn = true), Why::InTxn(Venue::Aster)),
+            (Box::new(|_, a| a.processing_transaction = true), Why::ProcessingTransaction(Venue::Aster)),
             (Box::new(|_, a| a.valid = false), Why::Invalid(Venue::Aster)),
             (Box::new(|b, _| b.bbo = None), Why::Empty(Venue::Binance)),
             (Box::new(|_, a| a.crossed = true), Why::Crossed(Venue::Aster)),
