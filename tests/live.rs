@@ -1,6 +1,6 @@
 //! Network tests against the real venues: `cargo test --test live -- --ignored --nocapture`.
 
-use orderbooks::bus::{self, FeedMsg, FeedState, Kind};
+use orderbooks::bus::{self, FeedMessage, FeedState, MessageKind};
 use orderbooks::config::{Idle, Venue, VenueConfig};
 use orderbooks::feed::{IoFeed, rest};
 use orderbooks::{logging, timing};
@@ -11,9 +11,18 @@ use std::time::{Duration, Instant};
 #[test]
 #[ignore]
 fn scales_match_exchange_info() {
-    for v in Venue::ALL {
-        rest::validate_scales(&VenueConfig::new(v, "ETHUSDT", Duration::from_secs(5), Idle::Block)).unwrap();
+    for venue in Venue::ALL {
+        rest::validate_scales(&VenueConfig::new(venue, "ETHUSDT", Duration::from_secs(5), Idle::Block)).unwrap();
     }
+}
+
+struct Observed {
+    venue: Venue,
+    feed: rtrb::Consumer<FeedMessage>,
+    state: Option<FeedState>,
+    last_update_id: u64,
+    diffs: usize,
+    last_ring_hop_ns: u64,
 }
 
 #[test]
@@ -21,31 +30,33 @@ fn scales_match_exchange_info() {
 fn both_feeds_reach_live_with_unbroken_chain() {
     timing::init(true);
     let stop = Arc::new(AtomicBool::new(false));
-    let mut rings = vec![];
+    let mut observed = vec![];
     let mut threads = vec![];
-    for v in Venue::ALL {
-        let (tx, rx) = rtrb::RingBuffer::new(bus::DATA_RING);
-        let (_ctl_tx, ctl_rx) = rtrb::RingBuffer::new(bus::CONTROL_RING);
+    for venue in Venue::ALL {
+        let (feed_tx, feed) = rtrb::RingBuffer::new(bus::DATA_RING_CAPACITY);
+        let (_control_tx, control_rx) = rtrb::RingBuffer::new(bus::CONTROL_RING_CAPACITY);
         let (log, _log_rx) = logging::channel();
-        let cfg = VenueConfig::new(v, "ETHUSDT", Duration::from_secs(5), Idle::Spin);
-        threads.push(IoFeed::new(cfg, tx, ctl_rx, log, Default::default(), stop.clone()).spawn());
-        rings.push((v, rx, None::<FeedState>, 0u64, 0usize, 0u64));
+        let config = VenueConfig::new(venue, "ETHUSDT", Duration::from_secs(5), Idle::Spin);
+        threads.push(IoFeed::new(config, feed_tx, control_rx, log, Default::default(), stop.clone()).spawn());
+        observed.push(Observed { venue, feed, state: None, last_update_id: 0, diffs: 0, last_ring_hop_ns: 0 });
     }
     let until = Instant::now() + Duration::from_secs(8);
     while Instant::now() < until {
-        for (v, rx, state, last_u, diffs, hop_ns) in &mut rings {
-            while let Ok(m) = rx.pop() {
-                match m {
-                    FeedMsg::Status { state: s, .. } => *state = Some(s),
-                    FeedMsg::Begin { kind: Kind::Snapshot, hdr, .. } => *last_u = hdr.u,
-                    FeedMsg::Begin { kind: Kind::Diff, hdr, .. } => {
-                        if *diffs > 0 {
-                            assert_eq!(hdr.pu, *last_u, "{v:?} chain broken");
+        for o in &mut observed {
+            while let Ok(message) = o.feed.pop() {
+                match message {
+                    FeedMessage::Status { state, .. } => o.state = Some(state),
+                    FeedMessage::Begin { kind: MessageKind::Snapshot, header, .. } => o.last_update_id = header.last_update_id,
+                    FeedMessage::Begin { kind: MessageKind::Diff, header, .. } => {
+                        if o.diffs > 0 {
+                            assert_eq!(header.prev_update_id, o.last_update_id, "{:?} chain broken", o.venue);
                         }
-                        *last_u = hdr.u;
-                        *diffs += 1;
+                        o.last_update_id = header.last_update_id;
+                        o.diffs += 1;
                     }
-                    FeedMsg::Commit { stamps } if stamps.t3 != 0 => *hop_ns = timing::nanos(stamps.t3, timing::now()),
+                    FeedMessage::Commit { stamps } if stamps.pushed != 0 => {
+                        o.last_ring_hop_ns = timing::nanos(stamps.pushed, timing::now())
+                    }
                     _ => {}
                 }
             }
@@ -53,9 +64,9 @@ fn both_feeds_reach_live_with_unbroken_chain() {
         std::hint::spin_loop();
     }
     stop.store(true, Relaxed);
-    threads.into_iter().for_each(|t| t.join().unwrap());
-    for (v, _, state, _, diffs, hop_ns) in rings {
-        println!("{v:?}: state={state:?} diffs={diffs} last ring hop={hop_ns}ns");
-        assert!(diffs > 10, "{v:?} got only {diffs} diffs");
+    threads.into_iter().for_each(|thread| thread.join().unwrap());
+    for o in observed {
+        println!("{:?}: state={:?} diffs={} last ring hop={}ns", o.venue, o.state, o.diffs, o.last_ring_hop_ns);
+        assert!(o.diffs > 10, "{:?} got only {} diffs", o.venue, o.diffs);
     }
 }

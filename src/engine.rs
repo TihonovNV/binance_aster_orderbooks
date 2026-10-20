@@ -1,10 +1,10 @@
 use crate::book::{Level, OrderBook, Side};
-use crate::bus::{Control, FeedMsg, FeedState, Kind, Reason};
+use crate::bus::{Control, FeedMessage, FeedState, MessageKind, Reason};
 use crate::config::{Idle, SignalParams, Venue, VenueConfig};
 use crate::feed::wire::Header;
 use crate::fixed::to_f64;
 use crate::logging::{Log, LogEvent};
-use crate::signal::{self, Bbo, Decision, SignalState, Snap};
+use crate::signal::{self, BookView, Decision, SignalState, TopOfBook};
 use crate::{rt, timing};
 use hdrhistogram::Histogram;
 use rtrb::{Consumer, Producer};
@@ -14,10 +14,10 @@ use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-pub const TELEMETRY_RING: usize = 64;
-pub const TOP: usize = 10;
-const DRAIN_PER_PASS: usize = 64;
-const EVAL_EVERY_NS: u64 = 250_000_000;
+pub const TELEMETRY_RING_CAPACITY: usize = 64;
+pub const TELEMETRY_DEPTH: usize = 10;
+const MAX_ENTRIES_PER_PASS: usize = 64;
+const EVALUATE_EVERY_NS: u64 = 250_000_000;
 const TELEMETRY_EVERY_NS: u64 = 100_000_000;
 const DECISION_LOG_EVERY_NS: u64 = 1_000_000_000;
 const TIMING_WINDOW_NS: u64 = 10_000_000_000;
@@ -47,8 +47,9 @@ pub struct StageStats {
     pub max_ns: u64,
 }
 
+/// Copy of one venue's state for the HTTP thread.
 #[derive(Clone, Copy, Debug)]
-pub struct VenueTele {
+pub struct VenueTelemetry {
     pub venue: Venue,
     pub state: FeedState,
     pub reason: Reason,
@@ -56,12 +57,12 @@ pub struct VenueTele {
     pub tradable: bool,
     pub crossed: bool,
     pub valid: bool,
-    pub last_u: u64,
-    pub event_ms: u64,
-    pub age_ms: f64,
-    pub depth: (usize, usize),
-    pub bids: [Level; TOP],
-    pub asks: [Level; TOP],
+    pub last_update_id: u64,
+    pub event_time_ms: u64,
+    pub book_age_ms: f64,
+    pub level_counts: (usize, usize),
+    pub bids: [Level; TELEMETRY_DEPTH],
+    pub asks: [Level; TELEMETRY_DEPTH],
     pub crossed_books: u64,
     pub engine_resyncs: u64,
     pub commits: u64,
@@ -70,57 +71,66 @@ pub struct VenueTele {
 
 #[derive(Clone, Copy, Debug)]
 pub struct Telemetry {
-    pub venues: [VenueTele; 2],
+    pub venues: [VenueTelemetry; 2],
     pub decision: Decision,
 }
 
-struct BookState<B> {
+/// The `Begin` of the transaction being received, applied at its `Commit`.
+#[derive(Clone, Copy)]
+struct OpenTransaction {
+    header: Header,
+    received_at: u64,
+    kind: MessageKind,
+}
+
+/// One venue's book plus everything the engine tracks about it.
+struct VenueBook<B> {
     venue: Venue,
-    px_scale: u32,
-    qty_scale: u32,
+    price_scale: u32,
+    quantity_scale: u32,
     book: B,
     state: FeedState,
     reason: Reason,
-    since: u64,
+    state_since: u64,
     processing_transaction: bool,
     valid: bool,
     crossed: bool,
-    chained: bool,
-    hdr: Header,
-    pending: (Header, u64, Kind),
-    recv: u64,
+    last_commit_was_diff: bool,
+    header: Header,
+    open_transaction: OpenTransaction,
+    received_at: u64,
     commits: u64,
     crossed_books: u64,
     engine_resyncs: u64,
-    batch: [Vec<Level>; 2],
-    hist: [Histogram<u64>; 7],
-    window: [StageStats; 7],
+    pending_levels: [Vec<Level>; 2],
+    histograms: [Histogram<u64>; 7],
+    last_window: [StageStats; 7],
 }
 
-impl<B: OrderBook> BookState<B> {
-    fn new(cfg: &VenueConfig) -> Self {
-        let h = || Histogram::new_with_bounds(1, 60_000_000_000, 3).expect("histogram");
+impl<B: OrderBook> VenueBook<B> {
+    fn new(config: &VenueConfig) -> Self {
+        let histogram = || Histogram::new_with_bounds(1, 60_000_000_000, 3).expect("histogram");
         Self {
-            venue: cfg.venue,
-            px_scale: cfg.px_scale,
-            qty_scale: cfg.qty_scale,
+            venue: config.venue,
+            price_scale: config.price_scale,
+            quantity_scale: config.quantity_scale,
             book: B::default(),
             state: FeedState::Disconnected,
             reason: Reason::Start,
-            since: timing::now(),
+            state_since: timing::now(),
             processing_transaction: false,
             valid: false,
             crossed: false,
-            chained: false,
-            hdr: Header::default(),
-            pending: (Header::default(), 0, Kind::Snapshot),
-            recv: 0,
+            last_commit_was_diff: false,
+            header: Header::default(),
+            open_transaction: OpenTransaction { header: Header::default(), received_at: 0, kind: MessageKind::Snapshot },
+            received_at: 0,
             commits: 0,
             crossed_books: 0,
             engine_resyncs: 0,
-            batch: [Vec::with_capacity(4096), Vec::with_capacity(4096)],
-            hist: std::array::from_fn(|_| h()),
-            window: [StageStats::default(); 7],
+            pending_levels: [Vec::with_capacity(4096), Vec::with_capacity(4096)],
+            histograms: std::array::from_fn(|_| histogram()),
+            last_window: [StageStats::default(); 7],
         }
     }
 
@@ -129,102 +139,108 @@ impl<B: OrderBook> BookState<B> {
     }
 
     #[inline]
-    fn record(&mut self, s: Stage, ns: u64) {
-        let _ = self.hist[s as usize].record(ns.max(1));
+    fn record(&mut self, stage: Stage, ns: u64) {
+        let _ = self.histograms[stage as usize].record(ns.max(1));
     }
 
-    fn snap(&self, now: u64) -> Snap {
-        let (px, q) = (|v: i64| to_f64(v, self.px_scale), |v: i64| to_f64(v, self.qty_scale));
-        let bbo = match (self.book.best(Side::Bid), self.book.best(Side::Ask)) {
-            (Some(b), Some(a)) => Some(Bbo { bid: px(b.px), bid_qty: q(b.qty), ask: px(a.px), ask_qty: q(a.qty) }),
+    fn view(&self, now: u64) -> BookView {
+        let price = |value: i64| to_f64(value, self.price_scale);
+        let quantity = |value: i64| to_f64(value, self.quantity_scale);
+        let top = match (self.book.best(Side::Bid), self.book.best(Side::Ask)) {
+            (Some(bid), Some(ask)) => Some(TopOfBook {
+                bid: price(bid.price),
+                bid_quantity: quantity(bid.quantity),
+                ask: price(ask.price),
+                ask_quantity: quantity(ask.quantity),
+            }),
             _ => None,
         };
-        let sum5 = |side| {
-            let mut top = [Level::default(); 5];
-            let n = self.book.top_n(side, &mut top);
-            q(top[..n].iter().map(|l| l.qty).sum())
+        let depth_5 = |side| {
+            let mut top_levels = [Level::default(); 5];
+            let count = self.book.top_n(side, &mut top_levels);
+            quantity(top_levels[..count].iter().map(|level| level.quantity).sum())
         };
-        Snap {
+        BookView {
             venue: self.venue,
             state: self.state,
             processing_transaction: self.processing_transaction,
             valid: self.valid,
             crossed: self.crossed,
-            bbo,
-            bid5: sum5(Side::Bid),
-            ask5: sum5(Side::Ask),
-            age_ms: if self.recv == 0 { f64::INFINITY } else { timing::nanos(self.recv, now) as f64 / 1e6 },
-            seq: self.hdr.u,
+            top,
+            bid_depth_5: depth_5(Side::Bid),
+            ask_depth_5: depth_5(Side::Ask),
+            age_ms: if self.received_at == 0 { f64::INFINITY } else { timing::nanos(self.received_at, now) as f64 / 1e6 },
+            last_update_id: self.header.last_update_id,
         }
     }
 
     fn roll_window(&mut self) {
-        for (w, h) in self.window.iter_mut().zip(&mut self.hist) {
-            *w = StageStats {
-                count: h.len(),
-                p50_ns: h.value_at_quantile(0.5),
-                p99_ns: h.value_at_quantile(0.99),
-                p999_ns: h.value_at_quantile(0.999),
-                max_ns: h.max(),
+        for (stats, histogram) in self.last_window.iter_mut().zip(&mut self.histograms) {
+            *stats = StageStats {
+                count: histogram.len(),
+                p50_ns: histogram.value_at_quantile(0.5),
+                p99_ns: histogram.value_at_quantile(0.99),
+                p999_ns: histogram.value_at_quantile(0.999),
+                max_ns: histogram.max(),
             };
-            h.reset();
+            histogram.reset();
         }
     }
 
-    fn tele(&self, now: u64) -> VenueTele {
-        let (mut bids, mut asks) = ([Level::default(); TOP], [Level::default(); TOP]);
+    fn telemetry(&self, now: u64) -> VenueTelemetry {
+        let (mut bids, mut asks) = ([Level::default(); TELEMETRY_DEPTH], [Level::default(); TELEMETRY_DEPTH]);
         self.book.top_n(Side::Bid, &mut bids);
         self.book.top_n(Side::Ask, &mut asks);
-        VenueTele {
+        VenueTelemetry {
             venue: self.venue,
             state: self.state,
             reason: self.reason,
-            in_state_ms: timing::nanos(self.since, now) / 1_000_000,
+            in_state_ms: timing::nanos(self.state_since, now) / 1_000_000,
             tradable: self.tradable(),
             crossed: self.crossed,
             valid: self.valid,
-            last_u: self.hdr.u,
-            event_ms: self.hdr.event_ms,
-            age_ms: if self.recv == 0 { f64::NAN } else { timing::nanos(self.recv, now) as f64 / 1e6 },
-            depth: (self.book.len(Side::Bid), self.book.len(Side::Ask)),
+            last_update_id: self.header.last_update_id,
+            event_time_ms: self.header.event_time_ms,
+            book_age_ms: if self.received_at == 0 { f64::NAN } else { timing::nanos(self.received_at, now) as f64 / 1e6 },
+            level_counts: (self.book.len(Side::Bid), self.book.len(Side::Ask)),
             bids,
             asks,
             crossed_books: self.crossed_books,
             engine_resyncs: self.engine_resyncs,
             commits: self.commits,
-            timing: self.window,
+            timing: self.last_window,
         }
     }
 }
 
-pub struct EngineIo {
-    pub rx: [Consumer<FeedMsg>; 2],
-    pub ctl: [Producer<Control>; 2],
-    pub tele: Producer<Telemetry>,
+pub struct EngineChannels {
+    pub feeds: [Consumer<FeedMessage>; 2],
+    pub control: [Producer<Control>; 2],
+    pub telemetry: Producer<Telemetry>,
     pub log: Log,
 }
 
 /// Single owner of both books; the signal runs inline between transactions.
 pub struct Engine<B> {
-    books: [BookState<B>; 2],
-    io: EngineIo,
-    sig: SignalState,
+    venues: [VenueBook<B>; 2],
+    channels: EngineChannels,
+    signal_state: SignalState,
     params: SignalParams,
-    last: Decision,
+    last_decision: Decision,
     state_changed: bool,
     idle: Idle,
     stop: Arc<AtomicBool>,
 }
 
 impl<B: OrderBook> Engine<B> {
-    pub fn new(cfgs: &[VenueConfig; 2], io: EngineIo, params: SignalParams, idle: Idle, stop: Arc<AtomicBool>) -> Self {
-        assert_eq!([cfgs[0].venue, cfgs[1].venue], Venue::ALL);
+    pub fn new(configs: &[VenueConfig; 2], channels: EngineChannels, params: SignalParams, idle: Idle, stop: Arc<AtomicBool>) -> Self {
+        assert_eq!([configs[0].venue, configs[1].venue], Venue::ALL);
         Self {
-            books: [BookState::new(&cfgs[0]), BookState::new(&cfgs[1])],
-            io,
-            sig: SignalState::default(),
+            venues: [VenueBook::new(&configs[0]), VenueBook::new(&configs[1])],
+            channels,
+            signal_state: SignalState::default(),
             params,
-            last: Decision::default(),
+            last_decision: Decision::default(),
             state_changed: false,
             idle,
             stop,
@@ -242,50 +258,54 @@ impl<B: OrderBook> Engine<B> {
     }
 
     fn run(mut self) {
-        let mut stamps: [Option<(u64, u64)>; 2] = [None; 2];
-        let (mut last_eval, mut last_tele, mut last_log, mut last_roll) = (0, 0, 0, timing::now());
+        let mut committed_this_pass: [Option<CommitTimes>; 2] = [None; 2];
+        let (mut last_evaluation, mut last_telemetry, mut last_decision_log) = (0, 0, 0);
+        let mut last_window_roll = timing::now();
         while !self.stop.load(Relaxed) {
             let mut committed = false;
-            for (i, stamp) in stamps.iter_mut().enumerate() {
-                for _ in 0..DRAIN_PER_PASS {
-                    let Ok(m) = self.io.rx[i].pop() else { break };
-                    if let Some(s) = self.handle(i, m) {
-                        *stamp = Some(s);
+            for (venue_index, commit_times) in committed_this_pass.iter_mut().enumerate() {
+                for _ in 0..MAX_ENTRIES_PER_PASS {
+                    let Ok(message) = self.channels.feeds[venue_index].pop() else { break };
+                    if let Some(times) = self.handle(venue_index, message) {
+                        *commit_times = Some(times);
                         committed = true;
                     }
                 }
             }
             let now = timing::now();
-            if std::mem::take(&mut self.state_changed) || committed || timing::nanos(last_eval, now) > EVAL_EVERY_NS {
-                let prev = self.last.bias;
-                let (b, a) = (self.books[0].snap(now), self.books[1].snap(now));
-                self.last = signal::decide(&b, &a, &mut self.sig, &self.params, now, timing::wall_ms());
-                last_eval = now;
-                let t6 = timing::now();
-                for (i, s) in stamps.iter_mut().enumerate() {
-                    if let Some((t0, t5)) = s.take()
-                        && t0 != 0
+            let state_changed = std::mem::take(&mut self.state_changed);
+            if committed || state_changed || timing::nanos(last_evaluation, now) > EVALUATE_EVERY_NS {
+                let previous_bias = self.last_decision.bias;
+                let (binance, aster) = (self.venues[0].view(now), self.venues[1].view(now));
+                self.last_decision = signal::decide(&binance, &aster, &mut self.signal_state, &self.params, now, timing::wall_ms());
+                last_evaluation = now;
+                let decided = timing::now();
+                for (venue_index, commit_times) in committed_this_pass.iter_mut().enumerate() {
+                    if let Some(times) = commit_times.take()
+                        && times.frame_read != 0
                     {
-                        self.books[i].record(Stage::Signal, timing::nanos(t5, t6));
-                        self.books[i].record(Stage::EndToEnd, timing::nanos(t0, t6));
+                        self.venues[venue_index].record(Stage::Signal, timing::nanos(times.applied, decided));
+                        self.venues[venue_index].record(Stage::EndToEnd, timing::nanos(times.frame_read, decided));
                     }
                 }
-                if self.last.bias != prev || timing::nanos(last_log, now) > DECISION_LOG_EVERY_NS {
-                    self.io.log.emit(LogEvent::Decision(self.last));
-                    last_log = now;
+                let bias_changed = self.last_decision.bias != previous_bias;
+                if bias_changed || timing::nanos(last_decision_log, now) > DECISION_LOG_EVERY_NS {
+                    self.channels.log.emit(LogEvent::Decision(self.last_decision));
+                    last_decision_log = now;
                 }
-                if self.last.bias != prev {
-                    last_tele = 0;
+                if bias_changed {
+                    last_telemetry = 0;
                 }
             }
-            if timing::nanos(last_roll, now) > TIMING_WINDOW_NS {
-                self.books.iter_mut().for_each(BookState::roll_window);
-                last_roll = now;
+            if timing::nanos(last_window_roll, now) > TIMING_WINDOW_NS {
+                self.venues.iter_mut().for_each(VenueBook::roll_window);
+                last_window_roll = now;
             }
-            if timing::nanos(last_tele, now) > TELEMETRY_EVERY_NS {
-                let t = Telemetry { venues: [self.books[0].tele(now), self.books[1].tele(now)], decision: self.last };
-                let _ = self.io.tele.push(t);
-                last_tele = now;
+            if timing::nanos(last_telemetry, now) > TELEMETRY_EVERY_NS {
+                let telemetry =
+                    Telemetry { venues: [self.venues[0].telemetry(now), self.venues[1].telemetry(now)], decision: self.last_decision };
+                let _ = self.channels.telemetry.push(telemetry);
+                last_telemetry = now;
             }
             if !committed {
                 match self.idle {
@@ -296,64 +316,77 @@ impl<B: OrderBook> Engine<B> {
         }
     }
 
-    /// Returns `(t0, commit time)` when a transaction committed (t0 = 0 if timing was off).
+    /// Returns the commit's timestamps when a transaction committed (`frame_read` = 0 if timing was off).
     #[inline]
-    fn handle(&mut self, i: usize, m: FeedMsg) -> Option<(u64, u64)> {
-        let b = &mut self.books[i];
-        match m {
-            FeedMsg::Status { state, reason } => {
-                (b.state, b.reason, b.since) = (state, reason, timing::now());
+    fn handle(&mut self, venue_index: usize, message: FeedMessage) -> Option<CommitTimes> {
+        let venue = &mut self.venues[venue_index];
+        match message {
+            FeedMessage::Status { state, reason } => {
+                (venue.state, venue.reason, venue.state_since) = (state, reason, timing::now());
                 self.state_changed = true;
                 None
             }
-            FeedMsg::Begin { kind, hdr, recv } => {
-                if kind == Kind::Snapshot {
-                    b.book.clear();
-                    (b.valid, b.chained) = (true, false);
-                } else if b.chained && b.valid && hdr.pu != b.hdr.u {
-                    b.valid = false;
-                    b.engine_resyncs += 1;
-                    self.io.log.emit(LogEvent::EngineResync { venue: b.venue, last_u: b.hdr.u, pu: hdr.pu });
-                    let _ = self.io.ctl[i].push(Control::Resync);
+            FeedMessage::Begin { kind, header, received_at } => {
+                if kind == MessageKind::Snapshot {
+                    venue.book.clear();
+                    (venue.valid, venue.last_commit_was_diff) = (true, false);
+                } else if venue.last_commit_was_diff && venue.valid && header.prev_update_id != venue.header.last_update_id {
+                    venue.valid = false;
+                    venue.engine_resyncs += 1;
+                    self.channels.log.emit(LogEvent::EngineResync {
+                        venue: venue.venue,
+                        book_update_id: venue.header.last_update_id,
+                        event_prev_update_id: header.prev_update_id,
+                    });
+                    let _ = self.channels.control[venue_index].push(Control::Resync);
                 }
-                b.batch.iter_mut().for_each(Vec::clear);
-                b.processing_transaction = true;
-                b.pending = (hdr, recv, kind);
+                venue.pending_levels.iter_mut().for_each(Vec::clear);
+                venue.processing_transaction = true;
+                venue.open_transaction = OpenTransaction { header, received_at, kind };
                 None
             }
-            FeedMsg::Levels { side, n, lv } => {
-                b.batch[side as usize].extend_from_slice(&lv[..n as usize]);
+            FeedMessage::Levels { side, count, levels } => {
+                venue.pending_levels[side as usize].extend_from_slice(&levels[..count as usize]);
                 None
             }
-            FeedMsg::Commit { stamps: s } => {
+            FeedMessage::Commit { stamps } => {
                 let popped = timing::now();
-                for (side, lv) in [Side::Bid, Side::Ask].into_iter().zip(&mut b.batch) {
-                    b.book.apply_batch(side, lv);
-                    lv.clear();
+                for (side, levels) in [Side::Bid, Side::Ask].into_iter().zip(&mut venue.pending_levels) {
+                    venue.book.apply_batch(side, levels);
+                    levels.clear();
                 }
-                let t5 = timing::now();
-                let kind;
-                (b.hdr, b.recv, kind) = b.pending;
-                b.processing_transaction = false;
-                b.chained = kind == Kind::Diff;
-                b.commits += 1;
-                let crossed = matches!((b.book.best(Side::Bid), b.book.best(Side::Ask)), (Some(x), Some(y)) if x.px >= y.px);
-                if crossed && !b.crossed {
-                    b.crossed_books += 1;
-                    let (x, y) = (b.book.best(Side::Bid).unwrap(), b.book.best(Side::Ask).unwrap());
-                    self.io.log.emit(LogEvent::Crossed { venue: b.venue, bid: x.px, ask: y.px });
+                let applied = timing::now();
+                let transaction = venue.open_transaction;
+                (venue.header, venue.received_at) = (transaction.header, transaction.received_at);
+                venue.processing_transaction = false;
+                venue.last_commit_was_diff = transaction.kind == MessageKind::Diff;
+                venue.commits += 1;
+                let best = (venue.book.best(Side::Bid), venue.book.best(Side::Ask));
+                let crossed = matches!(best, (Some(bid), Some(ask)) if bid.price >= ask.price);
+                if crossed
+                    && !venue.crossed
+                    && let (Some(bid), Some(ask)) = best
+                {
+                    venue.crossed_books += 1;
+                    self.channels.log.emit(LogEvent::Crossed { venue: venue.venue, bid: bid.price, ask: ask.price });
                 }
-                b.crossed = crossed;
-                if s.t0 == 0 {
-                    return Some((0, t5));
+                venue.crossed = crossed;
+                if stamps.frame_read == 0 {
+                    return Some(CommitTimes { frame_read: 0, applied });
                 }
-                b.record(Stage::Parse, timing::nanos(s.t0, s.t1));
-                b.record(Stage::Sync, timing::nanos(s.t1, s.t2));
-                b.record(Stage::Push, timing::nanos(s.t2, s.t3));
-                b.record(Stage::RingHop, timing::nanos(s.t3, popped));
-                b.record(Stage::Apply, timing::nanos(popped, t5));
-                Some((s.t0, t5))
+                venue.record(Stage::Parse, timing::nanos(stamps.frame_read, stamps.parsed));
+                venue.record(Stage::Sync, timing::nanos(stamps.parsed, stamps.sequenced));
+                venue.record(Stage::Push, timing::nanos(stamps.sequenced, stamps.pushed));
+                venue.record(Stage::RingHop, timing::nanos(stamps.pushed, popped));
+                venue.record(Stage::Apply, timing::nanos(popped, applied));
+                Some(CommitTimes { frame_read: stamps.frame_read, applied })
             }
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct CommitTimes {
+    frame_read: u64,
+    applied: u64,
 }

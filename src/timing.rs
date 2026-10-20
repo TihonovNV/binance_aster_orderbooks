@@ -30,13 +30,14 @@ pub fn enabled() -> bool {
     ENABLED.load(Relaxed)
 }
 
-pub fn set_enabled(on: bool) {
-    ENABLED.store(on, Relaxed);
+pub fn set_enabled(enabled: bool) {
+    ENABLED.store(enabled, Relaxed);
 }
 
+/// Current time if timing is on for this frame, else 0 ("not measured").
 #[inline]
-pub fn stamp(on: bool) -> u64 {
-    if on { now() } else { 0 }
+pub fn stamp_if(enabled: bool) -> u64 {
+    if enabled { now() } else { 0 }
 }
 
 pub fn wall_ms() -> u64 {

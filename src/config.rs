@@ -6,13 +6,13 @@ use std::{net::SocketAddr, path::PathBuf, time::Duration};
 #[command(about = "Binance + Aster ETHUSDT perp order books with a cross-venue signal", args_conflicts_with_subcommands = true)]
 pub struct Cli {
     #[command(subcommand)]
-    pub cmd: Option<Cmd>,
+    pub command: Option<Command>,
     #[command(flatten)]
     pub run: RunArgs,
 }
 
 #[derive(Subcommand, Debug)]
-pub enum Cmd {
+pub enum Command {
     /// Run feeds, engine, signal and status server (default)
     Run(RunArgs),
     /// Record REST snapshot + raw WS frames per venue for tests and benches
@@ -42,23 +42,33 @@ pub struct RunArgs {
 
 #[derive(Args, Debug, Clone, Copy, Serialize)]
 pub struct SignalParams {
+    /// Deviation from the basis needed to enter a bias; it is kept until it falls below half of this
     #[arg(long, default_value_t = 1.0)]
-    pub theta_bps: f64,
+    pub entry_threshold_bps: f64,
+    /// Aster top-5 imbalance against the bias that vetoes it
     #[arg(long, default_value_t = 0.3)]
-    pub kappa: f64,
+    pub imbalance_veto: f64,
+    /// Time constant of the EMA that tracks the normal Binance–Aster gap
     #[arg(long, default_value_t = 30.0)]
-    pub ema_secs: f64,
+    pub basis_ema_secs: f64,
     #[arg(long, default_value_t = 5.0)]
     pub max_spread_bps: f64,
     #[arg(long, default_value_t = 1000)]
     pub max_age_ms: u64,
     #[arg(long, default_value_t = 500)]
-    pub max_skew_ms: u64,
+    pub max_age_difference_ms: u64,
 }
 
 impl Default for SignalParams {
     fn default() -> Self {
-        Self { theta_bps: 1.0, kappa: 0.3, ema_secs: 30.0, max_spread_bps: 5.0, max_age_ms: 1000, max_skew_ms: 500 }
+        Self {
+            entry_threshold_bps: 1.0,
+            imbalance_veto: 0.3,
+            basis_ema_secs: 30.0,
+            max_spread_bps: 5.0,
+            max_age_ms: 1000,
+            max_age_difference_ms: 500,
+        }
     }
 }
 
@@ -94,7 +104,7 @@ pub enum Venue {
 impl Venue {
     pub const ALL: [Venue; 2] = [Venue::Binance, Venue::Aster];
 
-    pub fn idx(self) -> usize {
+    pub fn index(self) -> usize {
         self as usize
     }
 
@@ -113,8 +123,8 @@ pub struct VenueConfig {
     pub ws_url: String,
     pub rest_url: String,
     pub info_url: String,
-    pub px_scale: u32,
-    pub qty_scale: u32,
+    pub price_scale: u32,
+    pub quantity_scale: u32,
     pub watchdog: Duration,
     pub idle: Idle,
 }
@@ -125,15 +135,15 @@ impl VenueConfig {
             Venue::Binance => ("wss://fstream.binance.com/public", "https://fapi.binance.com"),
             Venue::Aster => ("wss://fstream.asterdex.com", "https://fapi.asterdex.com"),
         };
-        let lower = symbol.to_lowercase();
+        let stream_symbol = symbol.to_lowercase();
         Self {
             venue,
             symbol: symbol.to_uppercase(),
-            ws_url: format!("{ws}/stream?streams={lower}@depth@100ms"),
+            ws_url: format!("{ws}/stream?streams={stream_symbol}@depth@100ms"),
             rest_url: format!("{rest}/fapi/v1/depth?symbol={}&limit=1000", symbol.to_uppercase()),
             info_url: format!("{rest}/fapi/v1/exchangeInfo"),
-            px_scale: 2,
-            qty_scale: 3,
+            price_scale: 2,
+            quantity_scale: 3,
             watchdog,
             idle,
         }

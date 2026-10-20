@@ -17,7 +17,7 @@ Status server (default `127.0.0.1:8080`):
 
 | Endpoint | What |
 |---|---|
-| `GET /status` | per venue: state, reason, time in state, tradable/valid/crossed, last `u`, book age, depth, I/O counters (msgs, resyncs, gaps, reconnects, stale events, parse errors, ring overflows, REST latency, exchange→local lag); engine telemetry freshness; dropped log records |
+| `GET /status` | per venue: state, reason, time in state, tradable/valid/crossed, last update id, book age, depth, I/O counters (messages, resyncs, gaps, reconnects, stale events, parse errors, ring overflows, REST latency, exchange→local lag); engine telemetry freshness; dropped log records |
 | `GET /signal` | latest decision with every input number |
 | `GET /book/{binance\|aster}` | top 10 levels per side |
 | `GET /timing` · `POST /timing?enabled=true\|false` | per-stage latency percentiles (10 s windows), toggled at runtime |
@@ -80,8 +80,8 @@ Status server (default `127.0.0.1:8080`):
 
 | Condition | Action |
 |---|---|
-| `pu == last_u` | forward to the engine |
-| `u ≤ last_u` (stale or duplicate) | skip and count, **no resync** |
+| `pu` (`prev_update_id`) == the book's `last_update_id` | forward to the engine |
+| `u` (`last_update_id`) ≤ the book's `last_update_id` (stale or duplicate) | skip and count, **no resync** |
 | anything else: gap, out-of-order or partial overlap | **immediate resync** on the same connection |
 
 The sequencer (`feed/sync.rs`) is a pure state machine with no I/O and no book, and is unit-tested for every case above. In a 150 s probe and every run since, neither venue produced a gap.
@@ -133,12 +133,12 @@ Binance is treated as the leader and Aster as the follower. Each evaluation (aft
    - otherwise **Hold**
    - With hysteresis, the bias is kept until `dev` falls below θ/2.
 
-   Defaults: θ = 1 bps, κ = 0.3. All values are CLI flags.
+   Defaults: θ = 1 bps (`--entry-threshold-bps`), κ = 0.3 (`--imbalance-veto`), τ = 30 s (`--basis-ema-secs`). The gates are flags too (`--max-age-ms`, `--max-age-difference-ms`, `--max-spread-bps`).
 
 The decision is logged when it changes and every second:
 
 ```
-signal bias="LONG_BIAS" why=Signal dev_bps=+1.37 gap_bps=+1.03 ema_bps=-0.34 imb_a=+0.28 micro_b=2386.462 mid_a=2386.215 bbo_b=2386.46/2386.47 bbo_a=2386.20/2386.23 age_ms=405/0
+signal bias="LONG_BIAS" reason=Signal deviation_bps=+1.37 gap_bps=+1.03 basis_ema_bps=-0.34 aster_imbalance=+0.28 binance_microprice=2386.462 aster_mid=2386.215 binance_bid_ask=2386.46/2386.47 aster_bid_ask=2386.20/2386.23 age_ms_binance_aster=405/0
 ```
 
 `decide()` is a pure function and is unit-tested for each gate, basis removal, entry, the imbalance veto and hysteresis. Profitability is not claimed.
@@ -203,7 +203,7 @@ The engine buffers each transaction's levels per side and applies them once at `
 
 ## Limitations and production notes
 
-- **Exchange→local lag** (`lag_ms`) depends on the local wall clock and shows negative values on a skewed clock. Correcting it against `/fapi/v1/time` would be the fix.
+- **Exchange→local lag** (`exchange_lag_ms`) depends on the local wall clock and shows negative values on a skewed clock. Correcting it against `/fapi/v1/time` would be the fix.
 - **Deep levels:** Binance's 1000-level snapshot covers only ±0.4–0.5% around mid, but its diff stream reports changes at any price, out to the price limits.
   - In 60 s, 16% of Binance updates fell outside the snapshot's range, and the book grew to ~2,400 levels per side.
   - Beyond the snapshot edge we only know the levels that changed, so that part of the book is incomplete.

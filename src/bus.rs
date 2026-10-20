@@ -4,9 +4,11 @@ use crate::timing;
 use rtrb::Producer;
 use serde::Serialize;
 
-pub const CHUNK: usize = 32;
-pub const DATA_RING: usize = 4096;
-pub const CONTROL_RING: usize = 16;
+pub const LEVELS_PER_ENTRY: usize = 32;
+pub const DATA_RING_CAPACITY: usize = 4096;
+pub const CONTROL_RING_CAPACITY: usize = 16;
+
+const _: () = assert!(LEVELS_PER_ENTRY <= u8::MAX as usize);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -37,16 +39,17 @@ pub enum Reason {
     Shutdown,
 }
 
+/// Per-stage timestamps taken on the I/O thread; all zero when timing is off.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct IoStamps {
-    pub t0: u64,
-    pub t1: u64,
-    pub t2: u64,
-    pub t3: u64,
+    pub frame_read: u64,
+    pub parsed: u64,
+    pub sequenced: u64,
+    pub pushed: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Kind {
+pub enum MessageKind {
     Snapshot,
     Diff,
 }
@@ -55,10 +58,10 @@ pub enum Kind {
 /// Entries are fixed-size by design (no heap, no pointers across threads).
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Copy, Debug)]
-pub enum FeedMsg {
+pub enum FeedMessage {
     Status { state: FeedState, reason: Reason },
-    Begin { kind: Kind, hdr: Header, recv: u64 },
-    Levels { side: Side, n: u8, lv: [Level; CHUNK] },
+    Begin { kind: MessageKind, header: Header, received_at: u64 },
+    Levels { side: Side, count: u8, levels: [Level; LEVELS_PER_ENTRY] },
     Commit { stamps: IoStamps },
 }
 
@@ -67,27 +70,29 @@ pub enum Control {
     Resync,
 }
 
-pub fn slots_for(d: &Depth) -> usize {
-    2 + d.bids.len().div_ceil(CHUNK) + d.asks.len().div_ceil(CHUNK)
+/// Ring entries one depth message takes: `Begin` + `Commit` + level chunks per side.
+pub fn entries_needed(depth: &Depth) -> usize {
+    2 + depth.bids.len().div_ceil(LEVELS_PER_ENTRY) + depth.asks.len().div_ceil(LEVELS_PER_ENTRY)
 }
 
 /// All-or-nothing: pushes the whole transaction or nothing if the ring lacks room.
-pub fn push_depth(tx: &mut Producer<FeedMsg>, kind: Kind, d: &Depth, recv: u64, mut stamps: IoStamps) -> bool {
-    if tx.slots() < slots_for(d) {
+/// With a single producer, free slots can only grow after the check, so every push succeeds.
+pub fn push_depth(producer: &mut Producer<FeedMessage>, kind: MessageKind, depth: &Depth, received_at: u64, mut stamps: IoStamps) -> bool {
+    if producer.slots() < entries_needed(depth) {
         return false;
     }
-    let _ = tx.push(FeedMsg::Begin { kind, hdr: d.hdr, recv });
-    for (side, levels) in [(Side::Bid, &d.bids), (Side::Ask, &d.asks)] {
-        for c in levels.chunks(CHUNK) {
-            let mut lv = [Level::default(); CHUNK];
-            lv[..c.len()].copy_from_slice(c);
-            let _ = tx.push(FeedMsg::Levels { side, n: c.len() as u8, lv });
+    let _ = producer.push(FeedMessage::Begin { kind, header: depth.header, received_at });
+    for (side, side_levels) in [(Side::Bid, &depth.bids), (Side::Ask, &depth.asks)] {
+        for chunk in side_levels.chunks(LEVELS_PER_ENTRY) {
+            let mut levels = [Level::default(); LEVELS_PER_ENTRY];
+            levels[..chunk.len()].copy_from_slice(chunk);
+            let _ = producer.push(FeedMessage::Levels { side, count: chunk.len() as u8, levels });
         }
     }
-    if stamps.t0 != 0 {
-        stamps.t3 = timing::now();
+    if stamps.frame_read != 0 {
+        stamps.pushed = timing::now();
     }
-    let _ = tx.push(FeedMsg::Commit { stamps });
+    let _ = producer.push(FeedMessage::Commit { stamps });
     true
 }
 
@@ -97,26 +102,26 @@ mod tests {
 
     #[test]
     fn chunked_roundtrip_and_all_or_nothing() {
-        let mut d = Depth::default();
-        d.hdr.u = 7;
-        d.bids.extend((0..70).map(|i| Level { px: 1000 - i, qty: i + 1 }));
-        d.asks.extend((0..5).map(|i| Level { px: 2000 + i, qty: 1 }));
-        assert_eq!(slots_for(&d), 2 + 3 + 1);
+        let mut depth = Depth::default();
+        depth.header.last_update_id = 7;
+        depth.bids.extend((0..70).map(|i| Level { price: 1000 - i, quantity: i + 1 }));
+        depth.asks.extend((0..5).map(|i| Level { price: 2000 + i, quantity: 1 }));
+        assert_eq!(entries_needed(&depth), 2 + 3 + 1);
 
-        let (mut tx, mut rx) = rtrb::RingBuffer::new(6);
-        assert!(push_depth(&mut tx, Kind::Diff, &d, 1, IoStamps::default()));
-        assert!(!push_depth(&mut tx, Kind::Diff, &d, 1, IoStamps::default()));
+        let (mut producer, mut consumer) = rtrb::RingBuffer::new(6);
+        assert!(push_depth(&mut producer, MessageKind::Diff, &depth, 1, IoStamps::default()));
+        assert!(!push_depth(&mut producer, MessageKind::Diff, &depth, 1, IoStamps::default()));
 
         let (mut bids, mut asks) = (vec![], vec![]);
-        assert!(matches!(rx.pop(), Ok(FeedMsg::Begin { hdr, .. }) if hdr.u == 7));
-        while let Ok(m) = rx.pop() {
-            match m {
-                FeedMsg::Levels { side: Side::Bid, n, lv } => bids.extend_from_slice(&lv[..n as usize]),
-                FeedMsg::Levels { side: Side::Ask, n, lv } => asks.extend_from_slice(&lv[..n as usize]),
-                FeedMsg::Commit { .. } => break,
-                m => panic!("{m:?}"),
+        assert!(matches!(consumer.pop(), Ok(FeedMessage::Begin { header, .. }) if header.last_update_id == 7));
+        while let Ok(message) = consumer.pop() {
+            match message {
+                FeedMessage::Levels { side: Side::Bid, count, levels } => bids.extend_from_slice(&levels[..count as usize]),
+                FeedMessage::Levels { side: Side::Ask, count, levels } => asks.extend_from_slice(&levels[..count as usize]),
+                FeedMessage::Commit { .. } => break,
+                other => panic!("{other:?}"),
             }
         }
-        assert_eq!((bids, asks), (d.bids, d.asks));
+        assert_eq!((bids, asks), (depth.bids, depth.asks));
     }
 }

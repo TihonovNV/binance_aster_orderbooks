@@ -12,7 +12,7 @@ pub enum Bias {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Why {
+pub enum DecisionReason {
     #[default]
     Init,
     Signal,
@@ -25,39 +25,42 @@ pub enum Why {
     Crossed(Venue),
     Stale(Venue),
     WideSpread(Venue),
-    Skew,
+    AgeDifference,
 }
 
 /// What the signal needs from one book, taken by the engine between transactions.
 #[derive(Clone, Copy, Debug)]
-pub struct Snap {
+pub struct BookView {
     pub venue: Venue,
     pub state: FeedState,
     pub processing_transaction: bool,
     pub valid: bool,
     pub crossed: bool,
-    pub bbo: Option<Bbo>,
-    pub bid5: f64,
-    pub ask5: f64,
+    pub top: Option<TopOfBook>,
+    pub bid_depth_5: f64,
+    pub ask_depth_5: f64,
     pub age_ms: f64,
-    pub seq: u64,
+    pub last_update_id: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct Bbo {
+pub struct TopOfBook {
     pub bid: f64,
-    pub bid_qty: f64,
+    pub bid_quantity: f64,
     pub ask: f64,
-    pub ask_qty: f64,
+    pub ask_quantity: f64,
 }
 
-impl Bbo {
+impl TopOfBook {
     fn mid(&self) -> f64 {
         (self.bid + self.ask) / 2.0
     }
-    fn micro(&self) -> f64 {
-        (self.bid * self.ask_qty + self.ask * self.bid_qty) / (self.bid_qty + self.ask_qty)
+
+    /// Mid weighted toward the side with less size: that side is more likely to trade through.
+    fn microprice(&self) -> f64 {
+        (self.bid * self.ask_quantity + self.ask * self.bid_quantity) / (self.bid_quantity + self.ask_quantity)
     }
+
     fn spread_bps(&self) -> f64 {
         (self.ask - self.bid) / self.mid() * 1e4
     }
@@ -66,202 +69,220 @@ impl Bbo {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
 pub struct Decision {
     pub bias: Bias,
-    pub why: Why,
-    pub ts_ms: u64,
-    pub bid_b: f64,
-    pub ask_b: f64,
-    pub micro_b: f64,
-    pub bid_a: f64,
-    pub ask_a: f64,
-    pub mid_a: f64,
+    pub reason: DecisionReason,
+    pub wall_time_ms: u64,
+    pub binance_bid: f64,
+    pub binance_ask: f64,
+    pub binance_microprice: f64,
+    pub aster_bid: f64,
+    pub aster_ask: f64,
+    pub aster_mid: f64,
     pub gap_bps: f64,
-    pub ema_bps: f64,
-    pub dev_bps: f64,
-    pub imb_a: f64,
-    pub age_b_ms: f64,
-    pub age_a_ms: f64,
-    pub seq_b: u64,
-    pub seq_a: u64,
+    pub basis_ema_bps: f64,
+    pub deviation_bps: f64,
+    pub aster_imbalance: f64,
+    pub binance_age_ms: f64,
+    pub aster_age_ms: f64,
+    pub binance_update_id: u64,
+    pub aster_update_id: u64,
 }
 
 #[derive(Default)]
 pub struct SignalState {
-    ema: Option<f64>,
-    last_ns: u64,
+    basis_ema_bps: Option<f64>,
+    last_update_ns: u64,
     bias: Bias,
 }
 
-fn gate(s: &Snap, p: &SignalParams) -> Option<Why> {
-    let v = s.venue;
-    let Some(bbo) = s.bbo else { return Some(Why::Empty(v)) };
-    if s.state != FeedState::Live {
-        Some(Why::NotLive(v))
-    } else if s.processing_transaction {
-        Some(Why::ProcessingTransaction(v))
-    } else if !s.valid {
-        Some(Why::Invalid(v))
-    } else if s.crossed {
-        Some(Why::Crossed(v))
-    } else if s.age_ms > p.max_age_ms as f64 {
-        Some(Why::Stale(v))
-    } else if bbo.spread_bps() > p.max_spread_bps {
-        Some(Why::WideSpread(v))
+fn blocking_reason(view: &BookView, params: &SignalParams) -> Option<DecisionReason> {
+    let venue = view.venue;
+    let Some(top) = view.top else { return Some(DecisionReason::Empty(venue)) };
+    if view.state != FeedState::Live {
+        Some(DecisionReason::NotLive(venue))
+    } else if view.processing_transaction {
+        Some(DecisionReason::ProcessingTransaction(venue))
+    } else if !view.valid {
+        Some(DecisionReason::Invalid(venue))
+    } else if view.crossed {
+        Some(DecisionReason::Crossed(venue))
+    } else if view.age_ms > params.max_age_ms as f64 {
+        Some(DecisionReason::Stale(venue))
+    } else if top.spread_bps() > params.max_spread_bps {
+        Some(DecisionReason::WideSpread(venue))
     } else {
         None
     }
 }
 
 /// Lead-lag: Binance microprice vs Aster mid, de-biased by an EMA of the gap,
-/// confirmed by Aster top-5 imbalance, with enter θ / exit θ/2 hysteresis.
-pub fn decide(binance_snapshot: &Snap, aster_snapshot: &Snap, st: &mut SignalState, p: &SignalParams, now_ns: u64, ts_ms: u64) -> Decision {
-    let mut d = Decision {
-        ts_ms,
-        age_b_ms: binance_snapshot.age_ms,
-        age_a_ms: aster_snapshot.age_ms,
-        seq_b: binance_snapshot.seq,
-        seq_a: aster_snapshot.seq,
+/// confirmed by Aster top-5 imbalance, with enter at threshold / exit at half-threshold hysteresis.
+pub fn decide(
+    binance: &BookView,
+    aster: &BookView,
+    state: &mut SignalState,
+    params: &SignalParams,
+    now_ns: u64,
+    wall_time_ms: u64,
+) -> Decision {
+    let mut decision = Decision {
+        wall_time_ms,
+        binance_age_ms: binance.age_ms,
+        aster_age_ms: aster.age_ms,
+        binance_update_id: binance.last_update_id,
+        aster_update_id: aster.last_update_id,
         ..Default::default()
     };
-    if let Some(x) = binance_snapshot.bbo {
-        (d.bid_b, d.ask_b, d.micro_b) = (x.bid, x.ask, x.micro());
+    if let Some(top) = binance.top {
+        (decision.binance_bid, decision.binance_ask, decision.binance_microprice) = (top.bid, top.ask, top.microprice());
     }
-    if let Some(x) = aster_snapshot.bbo {
-        (d.bid_a, d.ask_a, d.mid_a) = (x.bid, x.ask, x.mid());
+    if let Some(top) = aster.top {
+        (decision.aster_bid, decision.aster_ask, decision.aster_mid) = (top.bid, top.ask, top.mid());
     }
-    let blocked = gate(binance_snapshot, p)
-        .or_else(|| gate(aster_snapshot, p))
-        .or(((binance_snapshot.age_ms - aster_snapshot.age_ms).abs() > p.max_skew_ms as f64).then_some(Why::Skew));
-    if let Some(why) = blocked {
-        st.bias = Bias::Hold;
-        d.why = why;
-        return d;
+    let ages_too_far_apart = (binance.age_ms - aster.age_ms).abs() > params.max_age_difference_ms as f64;
+    let blocked = blocking_reason(binance, params)
+        .or_else(|| blocking_reason(aster, params))
+        .or(ages_too_far_apart.then_some(DecisionReason::AgeDifference));
+    if let Some(reason) = blocked {
+        state.bias = Bias::Hold;
+        decision.reason = reason;
+        return decision;
     }
 
-    d.gap_bps = (d.micro_b - d.mid_a) / d.mid_a * 1e4;
-    let ema = match st.ema {
-        None => d.gap_bps,
-        Some(e) => {
-            let dt = (now_ns.saturating_sub(st.last_ns)) as f64 / 1e9;
-            e + (1.0 - (-dt / p.ema_secs).exp()) * (d.gap_bps - e)
+    decision.gap_bps = (decision.binance_microprice - decision.aster_mid) / decision.aster_mid * 1e4;
+    let basis_ema_bps = match state.basis_ema_bps {
+        None => decision.gap_bps,
+        Some(previous) => {
+            let elapsed_secs = (now_ns.saturating_sub(state.last_update_ns)) as f64 / 1e9;
+            previous + (1.0 - (-elapsed_secs / params.basis_ema_secs).exp()) * (decision.gap_bps - previous)
         }
     };
-    (st.ema, st.last_ns) = (Some(ema), now_ns);
-    d.ema_bps = ema;
-    d.dev_bps = d.gap_bps - ema;
-    let depth = aster_snapshot.bid5 + aster_snapshot.ask5;
-    d.imb_a = if depth > 0.0 { (aster_snapshot.bid5 - aster_snapshot.ask5) / depth } else { 0.0 };
+    (state.basis_ema_bps, state.last_update_ns) = (Some(basis_ema_bps), now_ns);
+    decision.basis_ema_bps = basis_ema_bps;
+    decision.deviation_bps = decision.gap_bps - basis_ema_bps;
+    let aster_depth = aster.bid_depth_5 + aster.ask_depth_5;
+    decision.aster_imbalance = if aster_depth > 0.0 { (aster.bid_depth_5 - aster.ask_depth_5) / aster_depth } else { 0.0 };
 
-    let (long_th, short_th) = match st.bias {
-        Bias::LongBias => (p.theta_bps / 2.0, p.theta_bps),
-        Bias::ShortBias => (p.theta_bps, p.theta_bps / 2.0),
-        Bias::Hold => (p.theta_bps, p.theta_bps),
+    let threshold = params.entry_threshold_bps;
+    let (long_threshold, short_threshold) = match state.bias {
+        Bias::LongBias => (threshold / 2.0, threshold),
+        Bias::ShortBias => (threshold, threshold / 2.0),
+        Bias::Hold => (threshold, threshold),
     };
-    (d.bias, d.why) = if d.dev_bps > long_th {
-        if d.imb_a > -p.kappa { (Bias::LongBias, Why::Signal) } else { (Bias::Hold, Why::ImbalanceVeto) }
-    } else if d.dev_bps < -short_th {
-        if d.imb_a < p.kappa { (Bias::ShortBias, Why::Signal) } else { (Bias::Hold, Why::ImbalanceVeto) }
+    let veto = params.imbalance_veto;
+    (decision.bias, decision.reason) = if decision.deviation_bps > long_threshold {
+        if decision.aster_imbalance > -veto {
+            (Bias::LongBias, DecisionReason::Signal)
+        } else {
+            (Bias::Hold, DecisionReason::ImbalanceVeto)
+        }
+    } else if decision.deviation_bps < -short_threshold {
+        if decision.aster_imbalance < veto {
+            (Bias::ShortBias, DecisionReason::Signal)
+        } else {
+            (Bias::Hold, DecisionReason::ImbalanceVeto)
+        }
     } else {
-        (Bias::Hold, Why::BelowThreshold)
+        (Bias::Hold, DecisionReason::BelowThreshold)
     };
-    st.bias = d.bias;
-    d
+    state.bias = decision.bias;
+    decision
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const S: u64 = 1_000_000_000;
+    const SECOND_NS: u64 = 1_000_000_000;
 
-    fn snap(venue: Venue, bid: f64, ask: f64, bid_qty: f64, ask_qty: f64) -> Snap {
-        Snap {
+    fn top(bid: f64, ask: f64) -> Option<TopOfBook> {
+        Some(TopOfBook { bid, bid_quantity: 5.0, ask, ask_quantity: 5.0 })
+    }
+
+    fn view(venue: Venue, bid: f64, ask: f64) -> BookView {
+        BookView {
             venue,
             state: FeedState::Live,
             processing_transaction: false,
             valid: true,
             crossed: false,
-            bbo: Some(Bbo { bid, bid_qty, ask, ask_qty }),
-            bid5: 10.0,
-            ask5: 10.0,
+            top: top(bid, ask),
+            bid_depth_5: 10.0,
+            ask_depth_5: 10.0,
             age_ms: 10.0,
-            seq: 1,
+            last_update_id: 1,
         }
     }
 
-    fn base() -> (Snap, Snap, SignalState, SignalParams) {
-        (
-            snap(Venue::Binance, 100.0, 100.01, 5.0, 5.0),
-            snap(Venue::Aster, 100.0, 100.01, 5.0, 5.0),
-            SignalState::default(),
-            SignalParams::default(),
-        )
+    fn base() -> (BookView, BookView, SignalState, SignalParams) {
+        (view(Venue::Binance, 100.0, 100.01), view(Venue::Aster, 100.0, 100.01), SignalState::default(), SignalParams::default())
     }
 
     #[test]
     fn gates_block_with_reason() {
-        let (b, a, mut st, p) = base();
-        type Tweak = Box<dyn Fn(&mut Snap, &mut Snap)>;
-        let cases: [(Tweak, Why); 8] = [
-            (Box::new(|b, _| b.state = FeedState::Resyncing), Why::NotLive(Venue::Binance)),
-            (Box::new(|_, a| a.processing_transaction = true), Why::ProcessingTransaction(Venue::Aster)),
-            (Box::new(|_, a| a.valid = false), Why::Invalid(Venue::Aster)),
-            (Box::new(|b, _| b.bbo = None), Why::Empty(Venue::Binance)),
-            (Box::new(|_, a| a.crossed = true), Why::Crossed(Venue::Aster)),
-            (Box::new(|b, _| b.age_ms = 5_000.0), Why::Stale(Venue::Binance)),
-            (Box::new(|_, a| a.bbo = Some(Bbo { bid: 99.0, bid_qty: 1.0, ask: 101.0, ask_qty: 1.0 })), Why::WideSpread(Venue::Aster)),
-            (Box::new(|b, a| (b.age_ms, a.age_ms) = (10.0, 900.0)), Why::Skew),
+        let (binance, aster, mut state, params) = base();
+        type Tweak = Box<dyn Fn(&mut BookView, &mut BookView)>;
+        let cases: [(Tweak, DecisionReason); 8] = [
+            (Box::new(|binance, _| binance.state = FeedState::Resyncing), DecisionReason::NotLive(Venue::Binance)),
+            (Box::new(|_, aster| aster.processing_transaction = true), DecisionReason::ProcessingTransaction(Venue::Aster)),
+            (Box::new(|_, aster| aster.valid = false), DecisionReason::Invalid(Venue::Aster)),
+            (Box::new(|binance, _| binance.top = None), DecisionReason::Empty(Venue::Binance)),
+            (Box::new(|_, aster| aster.crossed = true), DecisionReason::Crossed(Venue::Aster)),
+            (Box::new(|binance, _| binance.age_ms = 5_000.0), DecisionReason::Stale(Venue::Binance)),
+            (Box::new(|_, aster| aster.top = top(99.0, 101.0)), DecisionReason::WideSpread(Venue::Aster)),
+            (Box::new(|binance, aster| (binance.age_ms, aster.age_ms) = (10.0, 900.0)), DecisionReason::AgeDifference),
         ];
-        for (f, why) in cases {
-            let (mut b, mut a) = (b, a);
-            f(&mut b, &mut a);
-            let d = decide(&b, &a, &mut st, &p, S, 0);
-            assert_eq!((d.bias, d.why), (Bias::Hold, why));
+        for (tweak, expected) in cases {
+            let (mut binance, mut aster) = (binance, aster);
+            tweak(&mut binance, &mut aster);
+            let decision = decide(&binance, &aster, &mut state, &params, SECOND_NS, 0);
+            assert_eq!((decision.bias, decision.reason), (Bias::Hold, expected));
         }
     }
 
     #[test]
     fn persistent_basis_is_not_a_signal() {
-        let (mut b, a, mut st, p) = base();
-        b.bbo = Some(Bbo { bid: 100.05, bid_qty: 5.0, ask: 100.06, ask_qty: 5.0 });
-        for i in 1..=5 {
-            let d = decide(&b, &a, &mut st, &p, i * S, 0);
-            assert_eq!(d.bias, Bias::Hold);
-            assert!(d.gap_bps > 4.0 && d.dev_bps.abs() < 1e-9);
+        let (mut binance, aster, mut state, params) = base();
+        binance.top = top(100.05, 100.06);
+        for second in 1..=5 {
+            let decision = decide(&binance, &aster, &mut state, &params, second * SECOND_NS, 0);
+            assert_eq!(decision.bias, Bias::Hold);
+            assert!(decision.gap_bps > 4.0 && decision.deviation_bps.abs() < 1e-9);
         }
     }
 
     #[test]
     fn binance_jump_gives_bias_and_hysteresis_holds_it() {
-        let (mut b, a, mut st, p) = base();
-        decide(&b, &a, &mut st, &p, S, 0);
-        b.bbo = Some(Bbo { bid: 100.03, bid_qty: 5.0, ask: 100.04, ask_qty: 5.0 });
-        let d = decide(&b, &a, &mut st, &p, S + 1, 0);
-        assert_eq!((d.bias, d.why), (Bias::LongBias, Why::Signal), "{d:?}");
-        assert!(d.dev_bps > p.theta_bps);
+        let (mut binance, aster, mut state, params) = base();
+        decide(&binance, &aster, &mut state, &params, SECOND_NS, 0);
+        binance.top = top(100.03, 100.04);
+        let decision = decide(&binance, &aster, &mut state, &params, SECOND_NS + 1, 0);
+        assert_eq!((decision.bias, decision.reason), (Bias::LongBias, DecisionReason::Signal), "{decision:?}");
+        assert!(decision.deviation_bps > params.entry_threshold_bps);
 
-        b.bbo = Some(Bbo { bid: 100.0075, bid_qty: 5.0, ask: 100.0175, ask_qty: 5.0 });
-        let d = decide(&b, &a, &mut st, &p, S + 2, 0);
-        assert!(d.dev_bps > p.theta_bps / 2.0 && d.dev_bps < p.theta_bps, "{d:?}");
-        assert_eq!(d.bias, Bias::LongBias, "hysteresis keeps the bias between θ/2 and θ");
+        binance.top = top(100.0075, 100.0175);
+        let decision = decide(&binance, &aster, &mut state, &params, SECOND_NS + 2, 0);
+        let threshold = params.entry_threshold_bps;
+        assert!(decision.deviation_bps > threshold / 2.0 && decision.deviation_bps < threshold, "{decision:?}");
+        assert_eq!(decision.bias, Bias::LongBias, "hysteresis keeps the bias between half-threshold and threshold");
 
-        b.bbo = Some(Bbo { bid: 99.97, bid_qty: 5.0, ask: 99.98, ask_qty: 5.0 });
-        assert_eq!(decide(&b, &a, &mut st, &p, S + 3, 0).bias, Bias::ShortBias);
+        binance.top = top(99.97, 99.98);
+        assert_eq!(decide(&binance, &aster, &mut state, &params, SECOND_NS + 3, 0).bias, Bias::ShortBias);
     }
 
     #[test]
     fn opposite_aster_imbalance_vetoes() {
-        let (mut b, mut a, mut st, p) = base();
-        decide(&b, &a, &mut st, &p, S, 0);
-        b.bbo = Some(Bbo { bid: 100.03, bid_qty: 5.0, ask: 100.04, ask_qty: 5.0 });
-        (a.bid5, a.ask5) = (1.0, 9.0);
-        let d = decide(&b, &a, &mut st, &p, S + 1, 0);
-        assert_eq!((d.bias, d.why), (Bias::Hold, Why::ImbalanceVeto));
-        assert!((d.imb_a + 0.8).abs() < 1e-9);
+        let (mut binance, mut aster, mut state, params) = base();
+        decide(&binance, &aster, &mut state, &params, SECOND_NS, 0);
+        binance.top = top(100.03, 100.04);
+        (aster.bid_depth_5, aster.ask_depth_5) = (1.0, 9.0);
+        let decision = decide(&binance, &aster, &mut state, &params, SECOND_NS + 1, 0);
+        assert_eq!((decision.bias, decision.reason), (Bias::Hold, DecisionReason::ImbalanceVeto));
+        assert!((decision.aster_imbalance + 0.8).abs() < 1e-9);
     }
 
     #[test]
     fn microprice_leans_to_thin_side() {
-        let x = Bbo { bid: 100.0, bid_qty: 9.0, ask: 101.0, ask_qty: 1.0 };
-        assert!((x.micro() - 100.9).abs() < 1e-9);
+        let top = TopOfBook { bid: 100.0, bid_quantity: 9.0, ask: 101.0, ask_quantity: 1.0 };
+        assert!((top.microprice() - 100.9).abs() < 1e-9);
     }
 }

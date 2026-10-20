@@ -1,6 +1,7 @@
 use super::{Level, OrderBook, Side};
 use std::collections::BTreeMap;
 
+/// Price → quantity per side, kept sorted by the map.
 #[derive(Default)]
 pub struct BTreeBook {
     bids: BTreeMap<i64, i64>,
@@ -8,7 +9,7 @@ pub struct BTreeBook {
 }
 
 impl BTreeBook {
-    fn side(&mut self, side: Side) -> &mut BTreeMap<i64, i64> {
+    fn side_mut(&mut self, side: Side) -> &mut BTreeMap<i64, i64> {
         match side {
             Side::Bid => &mut self.bids,
             Side::Ask => &mut self.asks,
@@ -23,26 +24,26 @@ impl OrderBook for BTreeBook {
     }
 
     #[inline]
-    fn apply(&mut self, side: Side, px: i64, qty: i64) {
-        let m = self.side(side);
-        if qty == 0 {
-            m.remove(&px);
+    fn apply(&mut self, side: Side, price: i64, quantity: i64) {
+        let levels = self.side_mut(side);
+        if quantity == 0 {
+            levels.remove(&price);
         } else {
-            m.insert(px, qty);
+            levels.insert(price, quantity);
         }
     }
 
     fn best(&self, side: Side) -> Option<Level> {
-        let kv = match side {
+        let best = match side {
             Side::Bid => self.bids.last_key_value(),
             Side::Ask => self.asks.first_key_value(),
         };
-        kv.map(|(&px, &qty)| Level { px, qty })
+        best.map(|(&price, &quantity)| Level { price, quantity })
     }
 
     fn top_n(&self, side: Side, out: &mut [Level]) -> usize {
-        fn fill<'a>(out: &mut [Level], it: impl Iterator<Item = (&'a i64, &'a i64)>) -> usize {
-            out.iter_mut().zip(it).map(|(o, (&px, &qty))| *o = Level { px, qty }).count()
+        fn fill<'a>(out: &mut [Level], best_first: impl Iterator<Item = (&'a i64, &'a i64)>) -> usize {
+            out.iter_mut().zip(best_first).map(|(slot, (&price, &quantity))| *slot = Level { price, quantity }).count()
         }
         match side {
             Side::Bid => fill(out, self.bids.iter().rev()),

@@ -9,44 +9,60 @@ pub enum RestError {
     Other(anyhow::Error),
 }
 
-pub struct Rest(Agent);
+/// Blocking HTTP client; the agent keeps the connection alive between snapshots.
+pub struct Rest {
+    agent: Agent,
+}
 
 impl Rest {
     pub fn new(timeout: Duration) -> Self {
-        Self(Agent::config_builder().timeout_global(Some(timeout)).http_status_as_error(false).build().new_agent())
+        Self { agent: Agent::config_builder().timeout_global(Some(timeout)).http_status_as_error(false).build().new_agent() }
     }
 
     pub fn get(&self, url: &str) -> Result<String, RestError> {
-        let mut resp = self.0.get(url).call().map_err(|e| RestError::Other(e.into()))?;
-        match resp.status().as_u16() {
-            200 => resp.body_mut().with_config().limit(32 << 20).read_to_string().map_err(|e| RestError::Other(e.into())),
+        let mut response = self.agent.get(url).call().map_err(|e| RestError::Other(e.into()))?;
+        match response.status().as_u16() {
+            200 => response.body_mut().with_config().limit(32 << 20).read_to_string().map_err(|e| RestError::Other(e.into())),
             429 | 418 => {
-                let secs = resp.headers().get("retry-after").and_then(|v| v.to_str().ok()?.parse().ok()).unwrap_or(30);
-                Err(RestError::RateLimited(Duration::from_secs(secs)))
+                let retry_after_secs =
+                    response.headers().get("retry-after").and_then(|value| value.to_str().ok()?.parse().ok()).unwrap_or(30);
+                Err(RestError::RateLimited(Duration::from_secs(retry_after_secs)))
             }
-            s => Err(RestError::Other(anyhow!("http {s}"))),
+            status => Err(RestError::Other(anyhow!("http {status}"))),
         }
     }
 }
 
 /// Fails fast if the venue's tick/step for the symbol disagree with our fixed-point scales.
-pub fn validate_scales(cfg: &VenueConfig) -> anyhow::Result<()> {
-    let body = Rest::new(Duration::from_secs(10)).get(&cfg.info_url).map_err(|e| match e {
-        RestError::RateLimited(d) => anyhow!("rate limited for {d:?}"),
+pub fn validate_scales(config: &VenueConfig) -> anyhow::Result<()> {
+    let body = Rest::new(Duration::from_secs(10)).get(&config.info_url).map_err(|e| match e {
+        RestError::RateLimited(retry_after) => anyhow!("rate limited for {retry_after:?}"),
         RestError::Other(e) => e,
     })?;
     let info: Value = sonic_rs::from_str(&body)?;
-    let sym = info["symbols"]
+    let symbol = info["symbols"]
         .as_array()
-        .and_then(|a| a.iter().find(|s| s["symbol"].as_str() == Some(&cfg.symbol)))
-        .ok_or_else(|| anyhow!("{} not listed on {}", cfg.symbol, cfg.venue.name()))?;
-    let filter = |kind: &str, field: &str| {
-        sym["filters"].as_array().and_then(|f| f.iter().find(|x| x["filterType"].as_str() == Some(kind))).and_then(|x| x[field].as_str())
+        .and_then(|symbols| symbols.iter().find(|s| s["symbol"].as_str() == Some(&config.symbol)))
+        .ok_or_else(|| anyhow!("{} not listed on {}", config.symbol, config.venue.name()))?;
+    let filter_value = |filter_type: &str, field: &str| {
+        symbol["filters"]
+            .as_array()
+            .and_then(|filters| filters.iter().find(|filter| filter["filterType"].as_str() == Some(filter_type)))
+            .and_then(|filter| filter[field].as_str())
     };
-    let decimals = |s: &str| s.trim_end_matches('0').split_once('.').map_or(0, |(_, f)| f.len() as u32);
-    let (tick, step) = (filter("PRICE_FILTER", "tickSize"), filter("LOT_SIZE", "stepSize"));
-    match (tick.map(decimals), step.map(decimals)) {
-        (Some(p), Some(q)) if p <= cfg.px_scale && q <= cfg.qty_scale => Ok(()),
-        _ => bail!("{}: tick {tick:?} / step {step:?} do not fit scales {}/{}", cfg.venue.name(), cfg.px_scale, cfg.qty_scale),
+    let decimals = |text: &str| text.trim_end_matches('0').split_once('.').map_or(0, |(_, fraction)| fraction.len() as u32);
+    let (tick_size, step_size) = (filter_value("PRICE_FILTER", "tickSize"), filter_value("LOT_SIZE", "stepSize"));
+    match (tick_size.map(decimals), step_size.map(decimals)) {
+        (Some(price_decimals), Some(quantity_decimals))
+            if price_decimals <= config.price_scale && quantity_decimals <= config.quantity_scale =>
+        {
+            Ok(())
+        }
+        _ => bail!(
+            "{}: tick {tick_size:?} / step {step_size:?} do not fit scales {}/{}",
+            config.venue.name(),
+            config.price_scale,
+            config.quantity_scale
+        ),
     }
 }

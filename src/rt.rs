@@ -15,8 +15,8 @@ pub fn hot_thread() {
 }
 
 /// Waits without sleeping in spin mode; returns false if shutdown was requested.
-pub fn wait(d: Duration, idle: Idle, stop: &AtomicBool) -> bool {
-    let deadline = Instant::now() + d;
+pub fn wait(duration: Duration, idle: Idle, stop: &AtomicBool) -> bool {
+    let deadline = Instant::now() + duration;
     while Instant::now() < deadline {
         if stop.load(Relaxed) {
             return false;
@@ -30,17 +30,19 @@ pub fn wait(d: Duration, idle: Idle, stop: &AtomicBool) -> bool {
 }
 
 #[derive(Default)]
-pub struct Backoff(u32);
+pub struct Backoff {
+    attempt: u32,
+}
 
 impl Backoff {
     /// Exponential 200 ms → 30 s with equal jitter.
     pub fn delay(&mut self) -> Duration {
-        let cap = (200u64 << self.0).min(30_000);
-        self.0 = (self.0 + 1).min(8);
-        Duration::from_millis(fastrand::u64(cap / 2..=cap))
+        let max_ms = (200u64 << self.attempt).min(30_000);
+        self.attempt = (self.attempt + 1).min(8);
+        Duration::from_millis(fastrand::u64(max_ms / 2..=max_ms))
     }
 
     pub fn reset(&mut self) {
-        self.0 = 0;
+        self.attempt = 0;
     }
 }

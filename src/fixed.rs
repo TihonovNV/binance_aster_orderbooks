@@ -1,38 +1,38 @@
 /// Parses an unsigned decimal string into an integer scaled by `10^scale`.
 /// Extra fractional digits are accepted only if they are zeros.
 #[inline]
-pub fn parse(s: &str, scale: u32) -> Option<i64> {
-    let mut v: i64 = 0;
-    let mut dot = false;
-    let mut frac = 0u32;
-    let mut digits = false;
-    for &c in s.as_bytes() {
-        match c {
+pub fn parse(text: &str, scale: u32) -> Option<i64> {
+    let mut value: i64 = 0;
+    let mut seen_dot = false;
+    let mut fraction_digits = 0u32;
+    let mut seen_digit = false;
+    for &byte in text.as_bytes() {
+        match byte {
             b'0'..=b'9' => {
-                digits = true;
-                if dot {
-                    if frac == scale {
-                        if c != b'0' {
+                seen_digit = true;
+                if seen_dot {
+                    if fraction_digits == scale {
+                        if byte != b'0' {
                             return None;
                         }
                         continue;
                     }
-                    frac += 1;
+                    fraction_digits += 1;
                 }
-                v = v.checked_mul(10)?.checked_add((c - b'0') as i64)?;
+                value = value.checked_mul(10)?.checked_add((byte - b'0') as i64)?;
             }
-            b'.' if !dot => dot = true,
+            b'.' if !seen_dot => seen_dot = true,
             _ => return None,
         }
     }
-    if !digits {
+    if !seen_digit {
         return None;
     }
-    v.checked_mul(10i64.pow(scale - frac))
+    value.checked_mul(10i64.pow(scale - fraction_digits))
 }
 
-pub fn to_f64(v: i64, scale: u32) -> f64 {
-    v as f64 / 10f64.powi(scale as i32)
+pub fn to_f64(value: i64, scale: u32) -> f64 {
+    value as f64 / 10f64.powi(scale as i32)
 }
 
 #[cfg(test)]
@@ -53,8 +53,8 @@ mod tests {
 
     #[test]
     fn rejects() {
-        for s in ["", ".", "1.234", "-1", "1e3", "1..2", "1.2.3", " 1", "99999999999999999999"] {
-            assert_eq!(parse(s, 2), None, "{s:?}");
+        for text in ["", ".", "1.234", "-1", "1e3", "1..2", "1.2.3", " 1", "99999999999999999999"] {
+            assert_eq!(parse(text, 2), None, "{text:?}");
         }
     }
 

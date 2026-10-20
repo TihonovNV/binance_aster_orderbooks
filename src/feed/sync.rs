@@ -3,69 +3,71 @@ use crate::feed::wire::Header;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
     Apply,
-    /// Already covered by the book (`u <= last_u` or older than the snapshot).
+    /// Already covered by the book (older than the book or the snapshot).
     Skip,
     /// Sequence broken: gap, out-of-order or partial overlap.
     Resync,
-    /// Snapshot is older than the first event after it (`U > lastUpdateId`).
+    /// Snapshot is older than the first event after it (`first_update_id > snapshot id`).
     StaleSnapshot,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum State {
     Unsynced,
-    Bridging { snap_u: u64 },
-    Live { last_u: u64 },
+    Bridging { snapshot_update_id: u64 },
+    Live { last_update_id: u64 },
 }
 
+/// Binance USD-M diff-depth sequencing rules (shared by Aster). Pure: no I/O, no book.
 #[derive(Debug)]
-pub struct Sync {
+pub struct Sequencer {
     state: State,
 }
 
-impl Default for Sync {
+impl Default for Sequencer {
     fn default() -> Self {
         Self { state: State::Unsynced }
     }
 }
 
-impl Sync {
+impl Sequencer {
     pub fn reset(&mut self) {
         self.state = State::Unsynced;
     }
 
-    pub fn on_snapshot(&mut self, last_update_id: u64) {
-        self.state = State::Bridging { snap_u: last_update_id };
+    pub fn on_snapshot(&mut self, snapshot_update_id: u64) {
+        self.state = State::Bridging { snapshot_update_id };
     }
 
     pub fn is_live(&self) -> bool {
         matches!(self.state, State::Live { .. })
     }
 
-    pub fn last_u(&self) -> Option<u64> {
+    pub fn last_update_id(&self) -> Option<u64> {
         match self.state {
-            State::Live { last_u } => Some(last_u),
+            State::Live { last_update_id } => Some(last_update_id),
             _ => None,
         }
     }
 
-    pub fn on_event(&mut self, h: &Header) -> Action {
+    /// Arm order matters: each guard relies on the arms above it.
+    pub fn on_event(&mut self, event: &Header) -> Action {
         match self.state {
             State::Unsynced => Action::Skip,
-            State::Bridging { snap_u } if h.u < snap_u => Action::Skip,
-            State::Bridging { snap_u } if h.first_u <= snap_u => {
-                self.state = State::Live { last_u: h.u };
+            State::Bridging { snapshot_update_id } if event.last_update_id < snapshot_update_id => Action::Skip,
+            State::Bridging { snapshot_update_id } if event.first_update_id <= snapshot_update_id => {
+                self.state = State::Live { last_update_id: event.last_update_id };
                 Action::Apply
             }
             State::Bridging { .. } => {
                 self.state = State::Unsynced;
                 Action::StaleSnapshot
             }
-            State::Live { last_u } if h.pu == last_u => {
-                self.state = State::Live { last_u: h.u };
+            State::Live { last_update_id } if event.prev_update_id == last_update_id => {
+                self.state = State::Live { last_update_id: event.last_update_id };
                 Action::Apply
             }
-            State::Live { last_u } if h.u <= last_u => Action::Skip,
+            State::Live { last_update_id } if event.last_update_id <= last_update_id => Action::Skip,
             State::Live { .. } => {
                 self.state = State::Unsynced;
                 Action::Resync
@@ -78,80 +80,80 @@ impl Sync {
 mod tests {
     use super::*;
 
-    fn ev(first_u: u64, u: u64, pu: u64) -> Header {
-        Header { first_u, u, pu, ..Default::default() }
+    fn event(first_update_id: u64, last_update_id: u64, prev_update_id: u64) -> Header {
+        Header { first_update_id, last_update_id, prev_update_id, ..Default::default() }
     }
 
-    fn live_at(u: u64) -> Sync {
-        let mut s = Sync::default();
-        s.on_snapshot(u);
-        assert_eq!(s.on_event(&ev(u - 1, u, u - 2)), Action::Apply);
-        s
+    fn live_at(update_id: u64) -> Sequencer {
+        let mut sequencer = Sequencer::default();
+        sequencer.on_snapshot(update_id);
+        assert_eq!(sequencer.on_event(&event(update_id - 1, update_id, update_id - 2)), Action::Apply);
+        sequencer
     }
 
     #[test]
     fn unsynced_skips() {
-        assert_eq!(Sync::default().on_event(&ev(1, 2, 0)), Action::Skip);
+        assert_eq!(Sequencer::default().on_event(&event(1, 2, 0)), Action::Skip);
     }
 
     #[test]
     fn bridge() {
-        let mut s = Sync::default();
-        s.on_snapshot(100);
-        assert_eq!(s.on_event(&ev(80, 90, 79)), Action::Skip);
-        assert_eq!(s.on_event(&ev(91, 99, 90)), Action::Skip);
-        assert_eq!(s.on_event(&ev(100, 105, 99)), Action::Apply);
-        assert_eq!(s.last_u(), Some(105));
+        let mut sequencer = Sequencer::default();
+        sequencer.on_snapshot(100);
+        assert_eq!(sequencer.on_event(&event(80, 90, 79)), Action::Skip);
+        assert_eq!(sequencer.on_event(&event(91, 99, 90)), Action::Skip);
+        assert_eq!(sequencer.on_event(&event(100, 105, 99)), Action::Apply);
+        assert_eq!(sequencer.last_update_id(), Some(105));
     }
 
     #[test]
     fn bridge_on_exact_boundary() {
-        let mut s = Sync::default();
-        s.on_snapshot(100);
-        assert_eq!(s.on_event(&ev(95, 100, 94)), Action::Apply);
+        let mut sequencer = Sequencer::default();
+        sequencer.on_snapshot(100);
+        assert_eq!(sequencer.on_event(&event(95, 100, 94)), Action::Apply);
     }
 
     #[test]
     fn stale_snapshot() {
-        let mut s = Sync::default();
-        s.on_snapshot(100);
-        assert_eq!(s.on_event(&ev(101, 110, 100)), Action::StaleSnapshot);
-        assert!(!s.is_live());
+        let mut sequencer = Sequencer::default();
+        sequencer.on_snapshot(100);
+        assert_eq!(sequencer.on_event(&event(101, 110, 100)), Action::StaleSnapshot);
+        assert!(!sequencer.is_live());
     }
 
     #[test]
     fn in_order() {
-        let mut s = live_at(100);
-        assert_eq!(s.on_event(&ev(101, 120, 100)), Action::Apply);
-        assert_eq!(s.on_event(&ev(121, 130, 120)), Action::Apply);
-        assert_eq!(s.last_u(), Some(130));
+        let mut sequencer = live_at(100);
+        assert_eq!(sequencer.on_event(&event(101, 120, 100)), Action::Apply);
+        assert_eq!(sequencer.on_event(&event(121, 130, 120)), Action::Apply);
+        assert_eq!(sequencer.last_update_id(), Some(130));
     }
 
     #[test]
     fn duplicate_and_old_are_skipped() {
-        let mut s = live_at(100);
-        assert_eq!(s.on_event(&ev(101, 120, 100)), Action::Apply);
-        assert_eq!(s.on_event(&ev(101, 120, 100)), Action::Skip);
-        assert_eq!(s.on_event(&ev(50, 60, 49)), Action::Skip);
-        assert_eq!(s.last_u(), Some(120));
+        let mut sequencer = live_at(100);
+        assert_eq!(sequencer.on_event(&event(101, 120, 100)), Action::Apply);
+        assert_eq!(sequencer.on_event(&event(101, 120, 100)), Action::Skip);
+        assert_eq!(sequencer.on_event(&event(50, 60, 49)), Action::Skip);
+        assert_eq!(sequencer.last_update_id(), Some(120));
     }
 
     #[test]
     fn gap_resyncs() {
-        let mut s = live_at(100);
-        assert_eq!(s.on_event(&ev(111, 120, 110)), Action::Resync);
-        assert!(!s.is_live());
+        let mut sequencer = live_at(100);
+        assert_eq!(sequencer.on_event(&event(111, 120, 110)), Action::Resync);
+        assert!(!sequencer.is_live());
     }
 
     #[test]
     fn out_of_order_resyncs() {
-        let mut s = live_at(100);
-        assert_eq!(s.on_event(&ev(121, 130, 120)), Action::Resync);
+        let mut sequencer = live_at(100);
+        assert_eq!(sequencer.on_event(&event(121, 130, 120)), Action::Resync);
     }
 
     #[test]
     fn partial_overlap_resyncs() {
-        let mut s = live_at(100);
-        assert_eq!(s.on_event(&ev(95, 110, 94)), Action::Resync);
+        let mut sequencer = live_at(100);
+        assert_eq!(sequencer.on_event(&event(95, 110, 94)), Action::Resync);
     }
 }

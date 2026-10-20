@@ -10,40 +10,41 @@ use tungstenite::Message;
 
 /// Writes `{venue}.snapshot.json` (fetched right after the WS connects, as in live sync)
 /// and `{venue}.jsonl` (one raw WS text frame per line).
-pub fn record(a: RecordArgs) -> anyhow::Result<()> {
-    fs::create_dir_all(&a.out)?;
-    let handles: Vec<_> = Venue::ALL
+pub fn record(args: RecordArgs) -> anyhow::Result<()> {
+    fs::create_dir_all(&args.out)?;
+    let recorders: Vec<_> = Venue::ALL
         .into_iter()
-        .map(|v| {
-            let (a, cfg) = (a.clone(), VenueConfig::new(v, &a.symbol, Duration::from_secs(10), Idle::Block));
+        .map(|venue| {
+            let args = args.clone();
+            let config = VenueConfig::new(venue, &args.symbol, Duration::from_secs(10), Idle::Block);
             thread::spawn(move || -> anyhow::Result<usize> {
-                let mut ws = ws::connect(&cfg.ws_url, Duration::from_secs(10), false)?;
-                let snap = Rest::new(Duration::from_secs(10)).get(&cfg.rest_url).map_err(|e| match e {
-                    RestError::RateLimited(d) => anyhow!("rate limited {d:?}"),
+                let mut ws = ws::connect(&config.ws_url, Duration::from_secs(10), false)?;
+                let snapshot = Rest::new(Duration::from_secs(10)).get(&config.rest_url).map_err(|e| match e {
+                    RestError::RateLimited(retry_after) => anyhow!("rate limited {retry_after:?}"),
                     RestError::Other(e) => e,
                 })?;
-                fs::write(a.out.join(format!("{}.snapshot.json", v.name())), snap)?;
-                let mut out = BufWriter::new(File::create(a.out.join(format!("{}.jsonl", v.name())))?);
-                let (until, mut n) = (Instant::now() + Duration::from_secs(a.secs), 0);
+                fs::write(args.out.join(format!("{}.snapshot.json", venue.name())), snapshot)?;
+                let mut frames_file = BufWriter::new(File::create(args.out.join(format!("{}.jsonl", venue.name())))?);
+                let (until, mut frames) = (Instant::now() + Duration::from_secs(args.secs), 0);
                 while Instant::now() < until {
                     match ws.read() {
-                        Ok(Message::Text(t)) => {
-                            writeln!(out, "{}", t.as_str())?;
-                            n += 1;
+                        Ok(Message::Text(text)) => {
+                            writeln!(frames_file, "{}", text.as_str())?;
+                            frames += 1;
                         }
                         Ok(_) => {}
                         Err(tungstenite::Error::Io(e)) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
                         Err(e) => return Err(e.into()),
                     }
                 }
-                out.flush()?;
-                Ok(n)
+                frames_file.flush()?;
+                Ok(frames)
             })
         })
         .collect();
-    for (v, h) in Venue::ALL.iter().zip(handles) {
-        let n = h.join().map_err(|_| anyhow!("recorder panicked"))??;
-        println!("{}: {n} frames -> {}", v.name(), a.out.display());
+    for (venue, recorder) in Venue::ALL.iter().zip(recorders) {
+        let frames = recorder.join().map_err(|_| anyhow!("recorder panicked"))??;
+        println!("{}: {frames} frames -> {}", venue.name(), args.out.display());
     }
     Ok(())
 }
