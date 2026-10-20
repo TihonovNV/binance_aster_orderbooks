@@ -256,7 +256,7 @@ impl<B: OrderBook> Engine<B> {
                 }
             }
             let now = timing::now();
-            if committed || std::mem::take(&mut self.state_changed) || timing::nanos(last_eval, now) > EVAL_EVERY_NS {
+            if std::mem::take(&mut self.state_changed) || committed || timing::nanos(last_eval, now) > EVAL_EVERY_NS {
                 let prev = self.last.bias;
                 let (b, a) = (self.books[0].snap(now), self.books[1].snap(now));
                 self.last = signal::decide(&b, &a, &mut self.sig, &self.params, now, timing::wall_ms());
